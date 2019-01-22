@@ -1,123 +1,155 @@
-library identifier: "pipeline-library@master",
-retriever: modernSCM(
-  [
-    $class: "GitSCMSource",
-    remote: "https://github.com/redhat-cop/pipeline-library.git"
-  ]
-)
-
-openshift.withCluster() {
-  env.NAMESPACE = openshift.project()
-  env.POM_FILE = env.BUILD_CONTEXT_DIR ? "${env.BUILD_CONTEXT_DIR}/pom.xml" : "pom.xml"
-  env.APP_NAME = "${JOB_NAME}".replaceAll(/-build.*/, '')
-  echo "Starting Pipeline for ${APP_NAME}..."
-  env.BUILD = "${env.NAMESPACE}"
-  env.DEV = "${APP_NAME}-dev"
-  env.STAGE = "${APP_NAME}-stage"
-  env.PROD = "${APP_NAME}-prod"
-}
-
+echo "Starting Pipeline for ....'${JOB_NAME}'"
+ def mvnCmd = "mvn -s configuration/cicd-settings-nexus3.xml"
+ 
 pipeline {
-  // Use Jenkins Maven slave
-  // Jenkins will dynamically provision this as OpenShift Pod
-  // All the stages and steps of this Pipeline will be executed on this Pod
-  // After Pipeline completes the Pod is killed so every run will have clean
-  // workspace
-  agent {
-    label 'maven'
-  }
-
-  // Pipeline Stages start here
-  // Requeres at least one stage
-  stages {
-
-    // Checkout source code
-    // This is required as Pipeline code is originally checkedout to
-    // Jenkins Master but this will also pull this same code to this slave
-    stage('Git Checkout') {
-      steps {
-        // Turn off Git's SSL cert check, uncomment if needed
-        // sh 'git config --global http.sslVerify false'
-        git url: "${APPLICATION_SOURCE_REPO}"
-      }
-    }
-
-    // Run Maven build, skipping tests
-    stage('Build'){
-      steps {
-        sh "mvn -B clean install -DskipTests=true -f ${POM_FILE}"
-      }
-    }
-
-    // Run Maven unit tests
-    stage('Unit Test'){
-      steps {
-        sh "mvn -B test -f ${POM_FILE}"
-      }
-    }
-
-    // Build Container Image using the artifacts produced in previous stages
-    stage('Build Container Image'){
-      steps {
-        // Copy the resulting artifacts into common directory
-        sh """
-          ls target/*
-          rm -rf oc-build && mkdir -p oc-build/deployments
-          for t in \$(echo "jar;war;ear" | tr ";" "\\n"); do
-            cp -rfv ./target/*.\$t oc-build/deployments/ 2> /dev/null || echo "No \$t files"
-          done
-        """
-
-        // Build container image using local Openshift cluster
-        // Giving all the artifacts to OpenShift Binary Build
-        // This places your artifacts into right location inside your S2I image
-        // if the S2I image supports it.
-        binaryBuild(projectName: env.BUILD, buildConfigName: env.APP_NAME, artifactsDirectoryName: "oc-build")
-      }
-    }
-
-    stage('Promote from Build to Dev') {
-      steps {
-        tagImage(sourceImageName: env.APP_NAME, sourceImagePath: env.BUILD, toImagePath: env.DEV)
-      }
-    }
-
-    stage ('Verify Deployment to Dev') {
-      steps {
-        verifyDeployment(projectName: env.DEV, targetApp: env.APP_NAME)
-      }
-    }
-
-    stage('Promote from Dev to Stage') {
-      steps {
-        tagImage(sourceImageName: env.APP_NAME, sourceImagePath: env.DEV, toImagePath: env.STAGE)
-      }
-    }
-
-    stage ('Verify Deployment to Stage') {
-      steps {
-        verifyDeployment(projectName: env.STAGE, targetApp: env.APP_NAME)
-      }
-    }
-
-    stage('Promotion gate') {
-      steps {
-        script {
-          input message: 'Promote application to Production?'
-        }
-      }
-    }
-
-    stage('Promote from Stage to Prod') {
-      steps {
-        tagImage(sourceImageName: env.APP_NAME, sourceImagePath: env.STAGE, toImagePath: env.PROD)
-      }
-    }
-
-    stage ('Verify Deployment to Prod') {
-      steps {
-        verifyDeployment(projectName: env.PROD, targetApp: env.APP_NAME)
-      }
-    }
-  }
-}
+    
+ agent { label 'maven' }
+    
+    stages {
+     stage('Build Code') {
+        steps {
+		 script {
+		     checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CheckoutOption', timeout: 240]], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '45517441-c819-4700-9a74-e9320a918ade', url: env.SOURCE_CODE_URL]]])
+              sh "${mvnCmd} install -DskipTests=true"
+			   echo "Maven Build Complete"
+					}
+                }
+            }
+     stage('Code Coverage') {
+        steps {
+		 script {
+          sh "${mvnCmd} sonar:sonar -Dsonar.host.url=http://sonarqube:9000 -DskipTests=true"
+		   echo "Code Test Coverage Complete"
+					}
+				}
+			}
+     stage('Unit Tests') {
+        steps {
+			script {
+            sh "${mvnCmd} test"
+			step([$class: 'JUnitResultArchiver', testResults: '**/target/surefire-reports/TEST-*.xml'])
+			  echo "Maven Unit test Complete"
+					}
+				}
+			}
+     stage('Archive App') {
+		steps {
+            script {
+//			 sh "${mvnCmd} deploy -DskipTests=true -P nexus3"
+             echo "Archive app complete"
+					}	
+				}
+			}
+     stage('Image Build') {
+        steps {
+		 script {
+			sh "echo Building Image from Jar File"
+			 sh """
+			  rm -rf oc-build && mkdir -p oc-build/deployments
+			    for t in \$(echo "jar;war;ear" | tr ";" "\\n"); do
+                 cp -rfv ./target/*.\$t oc-build/deployments/ 2> /dev/null || echo "No \$t files"
+			      done
+				"""
+			 openshift.withCluster('dev') {
+              openshift.withProject(env.PROJECT) {
+               openshift.selector("bc", env.APPLICATION_NAME).startBuild("--from-dir=oc-build/deployments", "--wait=true")
+			    echo "Building Image Complete"
+                            }
+                        }
+                    }
+                }
+            }
+     stage('Deploy DEV') {
+        steps {
+			script {
+			 echo "Starting Dev Deploy"
+			 openshift.withCluster('dev') {
+               openshift.withProject(env.PROJECT) {
+                try { openshift.selector(dc/env.APPLICATION_NAME).rollout().latest() } catch (err) { }
+                 //Verify deployment to dev code here
+				 echo "Deploy to Dev complete"
+							}
+						}
+					}
+				}
+			}
+	
+     stage('Deploy QA') { 
+	  agent { label 'skopeo' }
+        steps {
+            script {
+			 echo "Promoting new image to QA registry using Skopeo..."
+			  openshift.withProject(env.NAMESPACE) {
+			   withCredentials([
+				usernamePassword(credentialsId: "c3f49bb8-9c5b-40e3-8576-310980421366", usernameVariable: "QA_USER", passwordVariable: "QA_PWD"),
+				usernamePassword(credentialsId: "a0657c24-e4dd-48c3-acc5-f74db3104dbc", usernameVariable: "DEV_USER", passwordVariable: "DEV_PWD")
+				 ]) {
+                 sh "skopeo copy docker://docker-registry.default.svc:5000/${env.PROJECT}/${env.APPLICATION_NAME}:latest docker://docker-registry-default.ospqa.gcom.grainger.com/${env.PROJECT}/${env.APPLICATION_NAME}:latest --src-creds \"$DEV_USER:$DEV_PWD\" --dest-creds \"$QA_USER:$QA_PWD\" --src-tls-verify=false --dest-tls-verify=false"
+                    }
+				}
+				echo "Skopeo update complete"
+            openshift.withCluster('qa') {
+              openshift.withProject(env.PROJECT) {
+               openshift.selector("dc", env.APPLICATION_NAME).rollout().latest();
+					echo "Testing QA deployment"
+                  //Verify deploy to QA code here
+								}
+							}
+						}
+					}
+				}
+		
+     stage('Deploy PROD LF') {
+	  agent { label 'skopeo' }
+        steps {
+            mail (
+            to: env.EMAIL,
+            subject: "Job '${JOB_NAME}' (${BUILD_NUMBER}) is waiting for input",
+             body: "Please go to ${BUILD_URL} and verify the build");
+                 timeout(time:15, unit:'MINUTES') {
+                      input message: "Promote to Prod LF?", ok: "Promote"
+                 }
+                script {
+				 withCredentials([
+					usernamePassword(credentialsId: "c3f49bb8-9c5b-40e3-8576-310980421366", usernameVariable: "QA_USER", passwordVariable: "QA_PWD"),
+					usernamePassword(credentialsId: "43da03dd-ba91-4cf2-b2ae-175383e381f6", usernameVariable: "PROD_USER", passwordVariable: "PROD_PWD")
+					]) {
+                   sh "skopeo copy docker://docker-registry-default.ospqa.gcom.grainger.com/${env.PROJECT}/${env.APPLICATION_NAME}:latest docker://docker-registry-default.ospprodlf.gcom.grainger.com/${env.PROJECT}/${env.APPLICATION_NAME}:latest  --src-creds \"$QA_USER:$QA_PWD\" --dest-creds \"$PROD_USER:$PROD_PWD\" --src-tls-verify=false --dest-tls-verify=false"
+                        }
+            openshift.withCluster('prod-lf') {
+             echo "Starting Prod LF rollout"
+               openshift.withProject(env.PROJECT) {
+                openshift.selector("dc", env.APPLICATION_NAME).rollout().latest();
+                 //Verify deploy to Prod here
+								}
+							}
+						}
+					}
+				}
+	 
+    stage('Deploy PROD T5') {
+	 agent { label 'skopeo' }
+        steps {
+          timeout(time:120, unit:'MINUTES') {
+          input message: "Promote to Prod T5?", ok: "Promote"
+                 }
+			script {
+				 withCredentials([
+					usernamePassword(credentialsId: "c3f49bb8-9c5b-40e3-8576-310980421366", usernameVariable: "QA_USER", passwordVariable: "QA_PWD"),
+					usernamePassword(credentialsId: "8cb3c210-025b-4f8c-a09e-fab0f1063f11", usernameVariable: "PROD_USER", passwordVariable: "PROD_PWD")
+					]) {
+                   sh "skopeo copy docker://docker-registry-default.ospqa.gcom.grainger.com/${env.PROJECT}/${env.APPLICATION_NAME}:latest docker://docker-registry-default.ospprodt5.gcom.grainger.com/${env.PROJECT}/${env.APPLICATION_NAME}:latest  --src-creds \"$QA_USER:$QA_PWD\" --dest-creds \"$PROD_USER:$PROD_PWD\" --src-tls-verify=false --dest-tls-verify=false"
+                        }
+            openshift.withCluster('prod-t5') {
+			 echo "Staring Prod T5 rollout"
+               openshift.withProject(env.PROJECT) {
+                openshift.selector("dc", env.APPLICATION_NAME).rollout().latest();
+              
+                  //verify deploy to prod here
+										}
+									}
+								}
+							}      
+						}
+					}
+				}
